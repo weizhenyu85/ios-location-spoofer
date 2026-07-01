@@ -1061,49 +1061,121 @@
     return cfg;
   }
 
-  function loadRuntimeConfig(callback) {
+  function readRemoteConfigCache(url) {
+    if (!url || typeof $persistentStore === "undefined" || !$persistentStore.read) {
+      return null;
+    }
+    try {
+      var raw = $persistentStore.read("location_spoofer_remote_cfg");
+      if (!raw) {
+        return null;
+      }
+      var entry = JSON.parse(raw);
+      if (!entry || entry.url !== url || !entry.data) {
+        return null;
+      }
+      if (Date.now() - entry.ts > 60000) {
+        return null;
+      }
+      return entry.data;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeRemoteConfigCache(url, data) {
+    if (!url || typeof $persistentStore === "undefined" || !$persistentStore.write) {
+      return;
+    }
+    try {
+      $persistentStore.write(
+        "location_spoofer_remote_cfg",
+        JSON.stringify({ url: url, data: data, ts: Date.now() })
+      );
+    } catch (err) {
+      // ignore cache write failures
+    }
+  }
+
+  function refreshRemoteConfigCache(url, debug) {
+    if (!url || typeof $httpClient === "undefined" || !$httpClient.get) {
+      return;
+    }
+    $httpClient.get({ url: url, timeout: 5000 }, function (error, response, body) {
+      if (error || !body) {
+        if (debug) {
+          console.log("Location spoofer remote config refresh failed: " + (error || "empty body"));
+        }
+        return;
+      }
+      try {
+        writeRemoteConfigCache(url, JSON.parse(body));
+      } catch (err) {
+        if (debug) {
+          console.log("Location spoofer remote config refresh parse failed: " + err.message);
+        }
+      }
+    });
+  }
+
+  function applyAddressFromCache(cfg, address, debug) {
+    if (!address) {
+      return;
+    }
+    var cached = readGeocodeCache();
+    if (cached && cached.address === address && Number.isFinite(Number(cached.latitude)) && Number.isFinite(Number(cached.longitude))) {
+      cfg.latitude = cached.latitude;
+      cfg.longitude = cached.longitude;
+      if (cached.altitude != null) {
+        cfg.altitude = cached.altitude;
+      }
+      if (debug) {
+        console.log("Location spoofer geocode cache hit: " + address);
+      }
+      return;
+    }
+    if (debug) {
+      console.log("Location spoofer geocode cache miss: " + address + " (use manual lat/lng until cron refreshes)");
+    }
+  }
+
+  function loadRuntimeConfigSync() {
     var args = readScriptArguments();
     var cfg = mergeConfig(DEFAULT_CONFIG, configFromArgs(args));
     var configUrl = args.configUrl || args.cfg || args.url || "";
     var debug = cfg.debug === true || String(cfg.debug).toLowerCase() === "true";
     var address = String(args.address || "").trim();
 
-    function finishConfig() {
-      if (configUrl && typeof $httpClient !== "undefined" && $httpClient.get) {
-        $httpClient.get({ url: configUrl, timeout: 3000 }, function (error, response, body) {
-          if (!error && body) {
-            try {
-              cfg = mergeConfig(cfg, JSON.parse(body));
-            } catch (err) {
-              if (debug) {
-                console.log("Location spoofer config parse failed: " + err.message);
-              }
-            }
-          }
-          callback(normalizeConfig(cfg));
-        });
-        return;
+    applyAddressFromCache(cfg, address, debug);
+
+    if (configUrl) {
+      var remoteCfg = readRemoteConfigCache(configUrl);
+      if (remoteCfg) {
+        cfg = mergeConfig(cfg, remoteCfg);
+      } else if (debug) {
+        console.log("Location spoofer remote config cache miss: " + configUrl);
       }
-      callback(normalizeConfig(cfg));
+      refreshRemoteConfigCache(configUrl, debug);
     }
 
-    if (address) {
-      geocodeAddress(address, debug, function (resolved) {
-        if (resolved) {
-          cfg.latitude = resolved.latitude;
-          cfg.longitude = resolved.longitude;
-          if (resolved.altitude != null && (args.altitude == null || String(args.altitude).trim() === "")) {
-            cfg.altitude = resolved.altitude;
-          }
-        } else if (debug) {
-          console.log("Location spoofer geocode fallback to manual latitude/longitude");
-        }
-        finishConfig();
-      });
+    return normalizeConfig(cfg);
+  }
+
+  function loadRuntimeConfig(callback) {
+    callback(loadRuntimeConfigSync());
+  }
+
+  function runGeocodeCron() {
+    var args = readScriptArguments();
+    var address = String(args.address || "").trim();
+    var debug = parseBoolean(args.debug, false);
+    if (!address) {
+      $done({});
       return;
     }
-
-    finishConfig();
+    geocodeAddress(address, debug, function () {
+      $done({});
+    });
   }
 
   function headersWithBinaryBody(sourceHeaders, length) {
@@ -1176,59 +1248,43 @@
     return body;
   }
 
-  function decompressGzipAsync(bytes, callback) {
-    if (typeof DecompressionStream === "undefined" || typeof Response === "undefined") {
-      callback(bytes);
-      return;
-    }
-    try {
-      new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip")))
-        .arrayBuffer()
-        .then(function (buffer) {
-          callback(new Uint8Array(buffer));
-        })
-        .catch(function (err) {
-          if (typeof console !== "undefined") {
-            console.log("Location spoofer gzip async failed: " + err.message);
-          }
-          callback(bytes);
-        });
-    } catch (err) {
-      if (typeof console !== "undefined") {
-        console.log("Location spoofer gzip async unavailable: " + err.message);
-      }
-      callback(bytes);
-    }
-  }
+  function prepareResponseBodySync(config) {
+    var respHeaders = ($response && $response.headers) || {};
+    var contentEncoding = headerValue(respHeaders, "Content-Encoding");
+    var rawRespBody = $response && ($response.body != null ? $response.body : $response.bodyBytes);
+    logHttpDump("response-wire-original", $response, config);
+    logRawDump("response-wire-original", bodyToBytes(rawRespBody), config);
 
-  function decompressBodyBytes(body, contentEncoding, callback) {
-    var bytes = bodyToBytes(body);
+    var bytes = bodyToBytes(rawRespBody);
     if (!bytes || bytes.length < 2) {
-      callback(bytes);
       return;
     }
 
-    var enc = contentEncoding ? String(contentEncoding).toLowerCase() : "";
-    var gzipLikely = enc.indexOf("gzip") >= 0 || isGzipBytes(bytes);
-
-    if (!gzipLikely && enc.indexOf("deflate") < 0 && enc.indexOf("br") < 0) {
-      callback(bytes);
+    if (isGzipBytes(bytes) || (contentEncoding && String(contentEncoding).toLowerCase().indexOf("gzip") >= 0)) {
+      var decoded = bodyToBytes(decompressBody(rawRespBody, contentEncoding || "gzip"));
+      if (decoded && decoded.length > 2 && !isGzipBytes(decoded)) {
+        $response.body = decoded;
+        if (config.debug) {
+          console.log("Location spoofer decompressed body: " + bytes.length + " -> " + decoded.length + " bytes");
+        }
+        return;
+      }
+      if (config.debug) {
+        console.log(
+          "Location spoofer gzip body still compressed (len=" +
+            bytes.length +
+            "); ensure http-request prepare script is enabled"
+        );
+      }
       return;
     }
 
-    var decoded = decompressBody(body, contentEncoding);
-    var decodedBytes = bodyToBytes(decoded);
-    if (decodedBytes && decodedBytes.length > 2 && !isGzipBytes(decodedBytes) && decodedBytes.length !== bytes.length) {
-      callback(decodedBytes);
-      return;
+    if (contentEncoding) {
+      var plain = bodyToBytes(decompressBody(rawRespBody, contentEncoding));
+      if (plain) {
+        $response.body = plain;
+      }
     }
-
-    if (gzipLikely) {
-      decompressGzipAsync(bytes, callback);
-      return;
-    }
-
-    callback(bytes);
   }
 
   function headerValue(headers, name) {
@@ -1543,34 +1599,20 @@
     });
   }
 
-  function prepareResponseBody(config, callback) {
-    var respHeaders = ($response && $response.headers) || {};
-    var contentEncoding = headerValue(respHeaders, "Content-Encoding");
-    var rawRespBody = $response && ($response.body != null ? $response.body : $response.bodyBytes);
-    logHttpDump("response-wire-original", $response, config);
-    logRawDump("response-wire-original", bodyToBytes(rawRespBody), config);
-    decompressBodyBytes(rawRespBody, contentEncoding, function (decodedBytes) {
-      if (decodedBytes) {
-        $response.body = decodedBytes;
-      }
-      if (config.debug && decodedBytes && isGzipBytes(bodyToBytes(rawRespBody))) {
-        console.log(
-          "Location spoofer decompressed body: " +
-            bodyToBytes(rawRespBody).length +
-            " -> " +
-            decodedBytes.length +
-            " bytes, enc=" +
-            (contentEncoding || "gzip-magic")
-        );
-      }
-      callback();
-    });
+  function prepareResponseBody(config) {
+    prepareResponseBodySync(config);
   }
 
   function runShadowrocket() {
     var hasRequest = typeof $request !== "undefined";
     var hasResponse = typeof $response !== "undefined";
+    var args = readScriptArguments();
+    var mode = String(args.mode || "response").toLowerCase();
+
     if (!hasRequest && !hasResponse) {
+      if (mode === "cron" || mode === "geocode") {
+        runGeocodeCron();
+      }
       return;
     }
 
@@ -1600,9 +1642,8 @@
             donePassThrough();
             return;
           }
-          prepareResponseBody(config, function () {
-            continueResponseRewrite(config);
-          });
+          prepareResponseBody(config);
+          continueResponseRewrite(config);
           return;
         }
 
