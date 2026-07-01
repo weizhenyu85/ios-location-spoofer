@@ -2,6 +2,8 @@
 
 用代理软件的 HTTPS 解密功能，把 Apple 地图定位骗到世界任何角落。
 
+> 📖 **新手直接看这篇** → [**小白保姆级图文教程**](使用教程.md)（一步步教你安装、配置、生效，含常见问题排查）
+
 ## 参考项目
 
 本项目基于 [acheong08/ios-location-spoofer](https://github.com/acheong08/ios-location-spoofer) 的核心研究。原始项目是用 Go 写的独立 iOS App，通过自建 VPN + MITM 代理实现定位欺骗。
@@ -69,7 +71,13 @@ ios-location-spoofer.stoverride  # Stash
 location-spoofer.js              # 核心脚本（四平台共用）
 location-spoofer-qx.js           # QX 专用
 location-spoofer-config.json     # 配置样板
+使用教程.md                       # 小白保姆级图文教程
+location-picker/                 # 进阶（可选）：网页地图选点工具，点地图改定位、海拔自动
 ```
+
+## 进阶：网页地图选点工具
+
+经常换定位、懒得手动查坐标改参数？项目自带 [`location-picker/`](location-picker/) 一个自托管小工具（单文件 Node，零依赖）：点地图即定位、海拔按地形自动获取、精度可调、支持高德/卫星/国外地图，模块通过 `configUrl` 读取。需要一台服务器运行，部署方法见 [使用教程.md](使用教程.md) 的"进阶"章节。
 
 ## 友情链接
 
